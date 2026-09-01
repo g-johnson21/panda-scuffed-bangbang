@@ -34,15 +34,29 @@
  *   'b<side><0|1>'                      Arm/disarm bang-bang control
  *   'v<side><0|1>'                      Manual vent open(1) / close(0)
  *   'x<side>'                           Latched abort (cleared only by 'r')
+ *   'h'                                 GC heartbeat (see link watchdog below)
+ *   'TL' / 'TF'                         Tare LOX/Fuel PT to current PSI (persisted)
+ *   'Tz'                                Clear all PT tare offsets
+ *   'T<n>,<offset>'                     Set explicit PSI offset for channel n
  *
  * Telemetry (Serial2 → GC):
- *   'p<f0>,p<f1>,...'   — 16 PT signal values forwarded from V2
- *   'P<f0>,P<f1>,...'   — 16 PT pressures (PSI), scaled on V1 from p-values
+ *   'p<f0>,p<f1>'      — 2 PT signal values forwarded from V2
+ *   'P<f0>,P<f1>'      — 2 PT pressures (PSI), scaled on V1 from p-values
  *   's<f0>,s<f1>,...'   — 12 solenoid current voltages (V1 local)
  *   't<f0>,t<f1>,...'   — 12 LC+TC voltages (V1 local)
  *   'BB:<L|F>:<state>:<press>:<vent>:<pressure>'   1 Hz summary heartbeat
+ *   'LINK:<armed>:<lost>:<silentMs>'                1 Hz link-watchdog status
  *   'EVT:<ms>:<cat>:<L|F>:<detail>'                audit event on every BB
  * transition
+ *
+ * GC LINK WATCHDOG
+ * GC must send 'h' at 5 Hz. Any line from GC counts as liveness; 'h' exists so
+ * GC can prove liveness without commanding anything. After COMMS_LOSS_MS of
+ * silence both bang-bang controllers are forced safe; after COMMS_DISARM_MS
+ * the board disarms itself exactly as if 'r' had been received. The watchdog
+ * is dormant until the first 'h' of the boot, so firmware built ahead of a
+ * heartbeat-capable GC cannot nuisance-disarm — watch LINK:<armed> to confirm
+ * it is actually active. Recovery is never automatic: re-arm and re-enable.
  *
  * Serial5 is a direct TTL crossover from Panda V2 carrying PT CSV rows only.
  * The RS-485 transceiver on this bus is bypassed: V1 pin 20 → V2 pin 25,
@@ -66,6 +80,16 @@ static bool hasValidV2Pt = false;
 
 // Mirror of master-arm state (what BB gates on).
 static bool gArmed = false;
+
+// ── GC primary-link health (Serial2) ─────────────────────────────────────
+// lastGcRxMs is refreshed by ANY complete line from GC, not just heartbeats:
+// a command is proof of life too. gcWatchdogArmed latches on the first 'h' of
+// the boot and never clears, so a GC that stops heartbeating after having
+// started cannot silently switch the protection back off.
+static uint32_t lastGcRxMs = 0;
+static bool gcWatchdogArmed = false;
+static bool gcLinkLost = false;   // stage 1 tripped, not yet recovered
+static bool gcDisarmDone = false; // stage 2 fired for this outage
 
 // ── Bang-bang controllers ────────────────────────────────────────────────
 // BB configuration and safety limits are in PSI, so controllers must consume
@@ -101,16 +125,114 @@ static bool isBbOwned(uint8_t ch1) {
   return bbLox.ownsChannel(ch1) || bbFuel.ownsChannel(ch1);
 }
 
-static float ptMilliampToPsi(float currentMa) {
+static float ptTarePsiOffset[NUM_PT_CHANNELS] = {0};
+
+struct PtTareEepromBlock {
+  uint16_t magic;
+  float offset_psi[NUM_PT_CHANNELS];
+  uint8_t crc;
+};
+
+static uint8_t ptTareComputeCrc(const PtTareEepromBlock &block) {
+  uint8_t crc = 0;
+  const uint8_t *p = reinterpret_cast<const uint8_t *>(block.offset_psi);
+  for (size_t i = 0; i < sizeof(block.offset_psi); i++)
+    crc ^= p[i];
+  return crc;
+}
+
+static void ptTareLoadEeprom() {
+  PtTareEepromBlock block;
+  EEPROM.get(PT_TARE_EEPROM_ADDR, block);
+  if (block.magic != PT_TARE_EEPROM_MAGIC)
+    return;
+  if (block.crc != ptTareComputeCrc(block))
+    return;
+  memcpy(ptTarePsiOffset, block.offset_psi, sizeof(ptTarePsiOffset));
+}
+
+static void ptTareSaveEeprom() {
+  PtTareEepromBlock block;
+  block.magic = PT_TARE_EEPROM_MAGIC;
+  memcpy(block.offset_psi, ptTarePsiOffset, sizeof(block.offset_psi));
+  block.crc = ptTareComputeCrc(block);
+  EEPROM.put(PT_TARE_EEPROM_ADDR, block);
+}
+
+static float ptSignalToPsi(float signalVolts) {
+  const float currentMa = (signalVolts / PT_SHUNT_OHMS) * 1000.0f;
   return (currentMa - PT_ZERO_MA) * (PT_FULL_SCALE_PSI / PT_SPAN_MA);
+}
+
+static float ptSignalToTaredPsi(float signalVolts, uint8_t ch) {
+  return ptSignalToPsi(signalVolts) - ptTarePsiOffset[ch];
 }
 
 static bool hasFreshV2Pt() {
   return hasValidV2Pt && (millis() - lastV2PtMs <= BB_PT_STALE_MS);
 }
 
+// ── PSI median filter ────────────────────────────────────────────────────
+// Mitigation for sustained switching noise (e.g. arm relay/contactor
+// coupling into the PT analog front-end) riding on top of an otherwise
+// real signal. A rolling median over PT_PSI_MEDIAN_WINDOW samples (~250 ms
+// at V2's ~290 Hz cadence) rejects that noise without hiding a genuine,
+// continuously-out-of-range fault — BB's sanity check still sees the
+// filtered value, so a real fault still trips it, just without chasing
+// every single noisy sample. Raw v2PtData is left unfiltered so GC retains
+// the true signal for diagnostics.
+static constexpr uint8_t PT_PSI_MEDIAN_WINDOW = 75;
+
+struct PsiMedianFilter {
+  float ring[PT_PSI_MEDIAN_WINDOW];
+  uint8_t count = 0;
+  uint8_t idx = 0;
+};
+
+static PsiMedianFilter ptPsiFilters[NUM_PT_CHANNELS];
+
+static void resetMedianFilter(uint8_t ch) { ptPsiFilters[ch] = PsiMedianFilter{}; }
+
+static bool ptPsiSettled() {
+  if (!hasFreshV2Pt())
+    return false;
+  for (uint8_t ch = 0; ch < NUM_PT_CHANNELS; ch++) {
+    if (ptPsiFilters[ch].count < PT_PSI_MEDIAN_WINDOW)
+      return false;
+  }
+  return true;
+}
+
+static float medianFilterPsi(uint8_t ch, float sample) {
+  PsiMedianFilter &f = ptPsiFilters[ch];
+
+  f.ring[f.idx] = sample;
+  f.idx = (f.idx + 1) % PT_PSI_MEDIAN_WINDOW;
+  if (f.count < PT_PSI_MEDIAN_WINDOW)
+    f.count++;
+
+  float sorted[PT_PSI_MEDIAN_WINDOW];
+  const uint8_t n = f.count;
+  for (uint8_t i = 0; i < n; i++) {
+    const uint8_t ri =
+        (f.idx + PT_PSI_MEDIAN_WINDOW - n + i) % PT_PSI_MEDIAN_WINDOW;
+    sorted[i] = f.ring[ri];
+  }
+
+  for (uint8_t i = 1; i < n; i++) {
+    const float key = sorted[i];
+    int8_t j = i - 1;
+    while (j >= 0 && sorted[j] > key) {
+      sorted[j + 1] = sorted[j];
+      j--;
+    }
+    sorted[j + 1] = key;
+  }
+  return sorted[n / 2];
+}
+
 // ── Parse PT CSV from V2 into v2PtData[] ────────────────────────────────
-// Parse into temporaries and commit only a complete, numeric 16-channel frame.
+// Parse into temporaries and commit only a complete, numeric frame.
 // An idle-timeout fragment must not refresh the BB safety watchdog or mix new
 // leading channels with stale trailing channels.
 static bool parseV2PtPacket(char *packet) {
@@ -124,17 +246,20 @@ static bool parseV2PtPacket(char *packet) {
   while (tok && idx < NUM_PT_CHANNELS) {
     const char *num = (tok[0] == PT_IDENTIFIER) ? tok + 1 : tok;
     char *end = nullptr;
-    const float ptMa = strtof(num, &end);
-    if (end == num || *end != '\0' || !isfinite(ptMa))
+    const float signalVolts = strtof(num, &end);
+    if (end == num || *end != '\0' || !isfinite(signalVolts))
       return false;
-    raw[idx] = ptMa;
-    psi[idx] = ptMilliampToPsi(ptMa);
+    raw[idx] = signalVolts;
+    psi[idx] = ptSignalToTaredPsi(signalVolts, idx);
     idx++;
     tok = strtok(nullptr, ",");
   }
 
   if (idx != NUM_PT_CHANNELS || tok != nullptr)
     return false;
+
+  for (uint8_t ch = 0; ch < NUM_PT_CHANNELS; ch++)
+    psi[ch] = medianFilterPsi(ch, psi[ch]);
 
   memcpy(v2PtData, raw, sizeof(v2PtData));
   memcpy(v2PtPsiData, psi, sizeof(v2PtPsiData));
@@ -238,6 +363,10 @@ static void handleLowerB(const char *pkt) { // enable/disable sustain
       Serial2.println("BB_ERROR:pt_stale");
       return;
     }
+    if (!ptPsiSettled()) {
+      Serial2.println("BB_ERROR:pt_settling");
+      return;
+    }
     ctrl->enableSustain();
   } else if (stCh == '0') {
     ctrl->disableSustain();
@@ -283,6 +412,66 @@ static void handleLowerX(const char *pkt) { // latched abort
   ctrl->latchAbort();
 }
 
+static void applyPtTareOffset(uint8_t ch, float offsetPsi, char side) {
+  ptTarePsiOffset[ch] = offsetPsi;
+  resetMedianFilter(ch);
+  ptTareSaveEeprom();
+
+  char detail[48];
+  snprintf(detail, sizeof(detail), "ch=%u,offset=%.3f", ch, offsetPsi);
+  bbEmit("PT_TARE", side, detail);
+}
+
+static void handleT(const char *pkt) {
+  if (!pkt || pkt[0] != 'T') {
+    Serial2.println("PT_ERROR:parse");
+    return;
+  }
+
+  const char *body = pkt + 1;
+  if (body[0] == 'z' && body[1] == '\0') {
+    memset(ptTarePsiOffset, 0, sizeof(ptTarePsiOffset));
+    for (uint8_t ch = 0; ch < NUM_PT_CHANNELS; ch++)
+      resetMedianFilter(ch);
+    ptTareSaveEeprom();
+    bbEmit("PT_TARE", '-', "clear all");
+    return;
+  }
+
+  if (body[0] == 'L' && body[1] == '\0') {
+    if (!hasFreshV2Pt()) {
+      Serial2.println("PT_ERROR:no_data");
+      return;
+    }
+    applyPtTareOffset(BB_LOX_PT_CH, ptSignalToPsi(v2PtData[BB_LOX_PT_CH]), 'L');
+    return;
+  }
+
+  if (body[0] == 'F' && body[1] == '\0') {
+    if (!hasFreshV2Pt()) {
+      Serial2.println("PT_ERROR:no_data");
+      return;
+    }
+    applyPtTareOffset(BB_FUEL_PT_CH, ptSignalToPsi(v2PtData[BB_FUEL_PT_CH]), 'F');
+    return;
+  }
+
+  unsigned ch = 0;
+  float offsetPsi = 0.0f;
+  if (sscanf(body, "%u,%f", &ch, &offsetPsi) != 2 || ch >= NUM_PT_CHANNELS ||
+      !isfinite(offsetPsi)) {
+    Serial2.println("PT_ERROR:parse");
+    return;
+  }
+
+  char side = '-';
+  if (ch == BB_LOX_PT_CH)
+    side = 'L';
+  else if (ch == BB_FUEL_PT_CH)
+    side = 'F';
+  applyPtTareOffset((uint8_t)ch, offsetPsi, side);
+}
+
 // ── 1 Hz BB summary heartbeat ────────────────────────────────────────────
 static const char *stateStr(BBState s) {
   switch (s) {
@@ -309,6 +498,76 @@ static void printBbHeartbeat(const BBController &c) {
   Serial2.print(c.isVentOpen() ? 1 : 0);
   Serial2.print(':');
   Serial2.println(c.lastPressure(), 1);
+}
+
+// ── GC link status line (1 Hz, alongside the BB heartbeat) ───────────────
+// LINK:<armed01>:<lost01>:<silent_ms>
+// <armed01> is the single most important field: 0 means GC has never sent a
+// heartbeat this boot and NOTHING here is protecting the stand.
+static void printLinkStatus(uint32_t now) {
+  Serial2.print("LINK:");
+  Serial2.print(gcWatchdogArmed ? 1 : 0);
+  Serial2.print(':');
+  Serial2.print(gcLinkLost ? 1 : 0);
+  Serial2.print(':');
+  Serial2.println(gcWatchdogArmed ? (now - lastGcRxMs) : 0UL);
+}
+
+// ── GC primary-link watchdog ─────────────────────────────────────────────
+// Two stages, mirroring the fail-safe philosophy of the V2 PT watchdog:
+//
+//   stage 1 (COMMS_LOSS_MS)   bang-bang control off, BB valves driven closed
+//   stage 2 (COMMS_DISARM_MS) full disarm, byte-for-byte what operator 'r' does
+//
+// Recovery never restarts control on its own. As with PT_STALE, a healthy link
+// coming back only clears the latch; the operator must re-arm and re-issue
+// b<side>1. Anything else would let a flapping link cycle live valves.
+static void serviceGcLinkWatchdog(uint32_t now) {
+  if (!gcWatchdogArmed)
+    return;
+
+  const uint32_t silentMs = now - lastGcRxMs;
+
+  if (silentMs < COMMS_LOSS_MS) {
+    if (gcLinkLost) {
+      gcLinkLost = false;
+      gcDisarmDone = false;
+      bbEmit("COMMS_OK", '-', "GC link restored; re-arm and re-enable to resume");
+    }
+    return;
+  }
+
+  if (!gcLinkLost) {
+    gcLinkLost = true;
+    bbEmit("COMMS_LOSS", '-', "GC link silent; bang-bang forced safe");
+  }
+
+  // forceSafe() drives press and vent closed unconditionally and is a no-op
+  // once they already are (_setPress/_setVent early-return when unchanged), so
+  // calling it every tick costs nothing and emits nothing after the first.
+  // Running it unconditionally rather than only from SUSTAIN/AUTO_VENT also
+  // sweeps up a BB channel an operator had opened by hand while BB was off.
+  //
+  // ABORT is deliberately exempt: it parks the vent OPEN, which is the safe
+  // state for the over-pressure that latched it, and force-safing would close
+  // that vent on a stand nobody can currently talk to. The latch still clears
+  // only on a real disarm — including the stage-2 disarm below.
+  if (bbLox.state() != BBState::ABORT)
+    bbLox.forceSafe();
+  if (bbFuel.state() != BBState::ABORT)
+    bbFuel.forceSafe();
+
+  if (silentMs >= COMMS_DISARM_MS && !gcDisarmDone) {
+    gcDisarmDone = true;
+    bbEmit("COMMS_DISARM", '-', "no GC link for 10s; disarming");
+    digitalWrite(PIN_ARM, LOW);
+    digitalWrite(PIN_DISARM, HIGH);
+    gArmed = false;
+    bbLox.forceSafe();
+    bbFuel.forceSafe();
+    sh.cancelExecution();
+    sh.setAllChannelsOff();
+  }
 }
 
 // Periodic telemetry is best-effort. Unlike command responses and BB events,
@@ -444,6 +703,11 @@ void setup() {
   bbLox.forceSafe();
   bbFuel.forceSafe();
   bbLoadEeprom(bbLox, bbFuel);
+  ptTareLoadEeprom();
+  Serial2.print("PT_TARE:ch0=");
+  Serial2.print(ptTarePsiOffset[0], 3);
+  Serial2.print(",ch1=");
+  Serial2.println(ptTarePsiOffset[1], 3);
 
   Serial2.println("Panda Initialized!");
 }
@@ -477,6 +741,9 @@ void loop() {
   th.poll();
   if (th.isPacketReady()) {
     char *rxPacket = th.takePacket();
+    // Any complete line proves GC and the wire are alive — a malformed one
+    // included. Refresh before dispatch so even a rejected command counts.
+    lastGcRxMs = millis();
     if (DEBUG_PACKET)
       Serial.println(rxPacket);
     idChar = rxPacket[0];
@@ -555,12 +822,27 @@ void loop() {
       handleLowerV(rxPacket);
     else if (idChar == 'x')
       handleLowerX(rxPacket);
+    else if (idChar == 'T')
+      handleT(rxPacket);
+    else if (idChar == GC_HEARTBEAT_IDENTIFIER) {
+      // Liveness only, and deliberately silent: at 5 Hz an acknowledgement per
+      // beat would put avoidable traffic on a half-duplex bus this firmware
+      // works hard to keep idle. The 1 Hz LINK: line is the acknowledgement.
+      if (!gcWatchdogArmed) {
+        gcWatchdogArmed = true;
+        bbEmit("COMMS_WD_ARM", '-', "GC heartbeat seen; link watchdog active");
+      }
+    }
 
     size_t n = strnlen(rxPacket, 256);
     memset(rxPacket, 0, n);
   }
 
   sh.update();
+
+  // Service before BB runs, so no controller actuates on this tick on the
+  // strength of a command from a link that is already gone.
+  serviceGcLinkWatchdog(millis());
 
   // ── Bang-bang step ───────────────────────────────────────────────────
   // Loss of the V2 crossover must not leave a valve controlled indefinitely
@@ -579,8 +861,8 @@ void loop() {
       bbFuel.forceSafe();
     }
   }
-  bbLox.update(gArmed);
-  bbFuel.update(gArmed);
+  bbLox.update(gArmed, ptPsiSettled());
+  bbFuel.update(gArmed, ptPsiSettled());
 
   // ========== DAQ ==========
   sScanner.update();
@@ -628,10 +910,12 @@ void loop() {
     lastHeartbeatMs = now;
     // Heartbeats are small and infrequent. Only send them when they cannot
     // consume the space reserved for control responses/events.
+    // +128 covers both BB heartbeat lines plus the LINK: status line.
     if (Serial2.availableForWrite() >=
-        static_cast<int>(TX_PRIORITY_RESERVE + 64)) {
+        static_cast<int>(TX_PRIORITY_RESERVE + 128)) {
       printBbHeartbeat(bbLox);
       printBbHeartbeat(bbFuel);
+      printLinkStatus(now);
     }
   }
 }

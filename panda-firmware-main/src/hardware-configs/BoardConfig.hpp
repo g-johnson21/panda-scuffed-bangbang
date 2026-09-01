@@ -38,11 +38,31 @@ static constexpr uint32_t TELEMETRY_INTERVAL_MS = 50;       // 20 Hz
 static constexpr uint32_t BB_HEARTBEAT_INTERVAL_MS = 1000;  // 1 Hz
 static constexpr size_t TX_PRIORITY_RESERVE = 256;
 
+// ============== GC primary-link (Serial2) watchdog ============= //
+// The primary RS-485 link only carries GC->V1 traffic when the operator acts,
+// so silence by itself is NOT evidence of a dead link. GC must send a periodic
+// heartbeat ('h') for the board to tell "quiet" apart from "gone".
+//
+// The watchdog is HEARTBEAT-GATED: it stays dormant until the first 'h' of the
+// boot arrives, then latches armed until reset. A GC that never sends
+// heartbeats therefore behaves exactly as it did before this feature existed
+// (no protection, but no nuisance disarms either); a GC that does send them
+// gets full protection from its first beat onward. Whether the watchdog is
+// actually armed is published every second on the LINK: telemetry line, so an
+// un-armed watchdog can never be mistaken for a healthy one.
+static constexpr char GC_HEARTBEAT_IDENTIFIER = 'h';
+// GC should send 'h' at 5 Hz. Three missed beats trip stage 1; the value is
+// the direct analogue of BB_PT_STALE_MS on the V2 crossover.
+static constexpr uint32_t COMMS_LOSS_MS = 600;      // stage 1: bang-bang safe
+static constexpr uint32_t COMMS_DISARM_MS = 10000;  // stage 2: full disarm
+static_assert(COMMS_LOSS_MS < COMMS_DISARM_MS,
+              "BB must be forced safe before the disarm stage runs");
+
 static constexpr uint8_t NUM_MAX_COMMANDS = 32;
 static constexpr uint8_t DATA_DECIMALS = 6; // Number of decimal places in telemetry data
 
 static constexpr uint8_t NUM_DC_CHANNELS = 12;
-static constexpr uint8_t NUM_PT_CHANNELS = 16;
+static constexpr uint8_t NUM_PT_CHANNELS = 2;
 static constexpr uint8_t NUM_LC_CHANNELS = 6;
 static constexpr uint8_t NUM_TC_CHANNELS = 6;
 
@@ -53,10 +73,12 @@ static constexpr size_t TX_BUF_SIZE = 2048;
 static constexpr float tcConstant = 2217.294;
 static constexpr float tcOffset = 160;
 static constexpr float sConstant = 0.5;
-// PT scaling (mA -> psi), used for secondary scaled telemetry row.
+// V2 PT stream arrives as raw shunt voltage. Convert on V1: volts -> mA -> psi,
+// used for secondary scaled telemetry row.
+static constexpr float PT_SHUNT_OHMS = 47.0f;      // 4-20 mA into 47 ohm = 1-5 V
 static constexpr float PT_ZERO_MA = 4.0f;
 static constexpr float PT_SPAN_MA = 16.0f;          // 20 - 4
-static constexpr float PT_FULL_SCALE_PSI = 1500.0f; // Sensor rating
+static constexpr float PT_FULL_SCALE_PSI = 1500.0f * 0.9748f; // Sensor rating times scale
 
 static constexpr float tcOffsets[NUM_TC_CHANNELS] = {
     -0.07429,
@@ -80,8 +102,8 @@ static constexpr uint8_t BB_LOX_PT_CH  = 0;
 static constexpr uint8_t BB_FUEL_PT_CH = 1;
 
 // DC press-solenoid channels (1-indexed; maps to SequenceHandler::channelArr[ch-1]).
-static constexpr uint8_t BB_LOX_DC_CH  = 4;
-static constexpr uint8_t BB_FUEL_DC_CH = 7;
+static constexpr uint8_t BB_LOX_DC_CH  = 1;
+static constexpr uint8_t BB_FUEL_DC_CH = 2;
 
 // DC vent-solenoid channels (1-indexed). Set to BB_DC_CH_UNSET to disable
 // auto-vent / abort for that side; those commands will be rejected with
@@ -102,9 +124,9 @@ static constexpr uint8_t BB_FUEL_VENTURI_DN_PT = BB_PT_CH_UNSET;
 // Sanity bounds — BB disables if PT reading falls outside this range.
 static constexpr float BB_PRESSURE_MIN_PSI = -50.0f;
 static constexpr float BB_PRESSURE_MAX_PSI = 4000.0f;
-// V2 sends PT data at 20 Hz. Five missed frames force any active BB controller
-// safe and require an explicit re-enable after valid data resumes.
-static constexpr uint32_t BB_PT_STALE_MS = 250;
+// V2 sends PT data at ~250 Hz. ~50 ms without a complete frame force-safes any
+// active BB controller; operator must explicitly re-enable after data resumes.
+static constexpr uint32_t BB_PT_STALE_MS = 50;
 
 // Mass-flow correction update cadence (ms between setpoint nudges).
 static constexpr uint32_t BB_MDOT_UPDATE_MS = 500;
@@ -123,5 +145,10 @@ static constexpr float PSI_TO_PA         = 6894.757f;
 // struct layout changed; old EEPROM contents ignored on mismatch.
 static constexpr uint16_t BB_EEPROM_MAGIC = 0xBB44;
 static constexpr int      BB_EEPROM_ADDR  = 0;
+
+// PT tare offsets (PSI subtracted after V2→PSI conversion). Separate EEPROM
+// block so layout changes do not collide with BB config.
+static constexpr uint16_t PT_TARE_EEPROM_MAGIC = 0x5441; // "TA"
+static constexpr int      PT_TARE_EEPROM_ADDR  = 256;
 
 static constexpr uint8_t NUM_ACTUATORS = NUM_DC_CHANNELS;

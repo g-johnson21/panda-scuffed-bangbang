@@ -14,8 +14,8 @@
 // PandaV2 — PT telemetry only.
 //
 // This firmware has been deliberately stripped to the minimum needed to do one
-// job: read the 16 PT channels off mux A / ADC1, apply PT conversion/tare, and
-// emit the CSV row on both UARTs.
+// job: read LOX/FUEL PT channels (mux A ch 0–1) off ADC1 and emit the CSV
+// row on both UARTs.
 //
 //   Primary  (Serial7, RS-485) → GC: PT CSV row at TELEMETRY_INTERVAL_MS.
 //   Crossover (Serial6, TTL)   → V1: same row, same cadence.
@@ -34,10 +34,6 @@ CommsHandler comms2(Serial6);                   // direct TTL → V1
 // ── Buffers ────────────────────────────────────────────────────────────────
 static float muxA_data[NUM_MUX_A_CH] = {0};
 static float ptData   [NUM_PT_CH]    = {0};
-static float ptTareOffset[NUM_PT_CH] = {0};
-static float ptTareAccum[NUM_PT_CH] = {0};
-static uint16_t ptTareScanCount = 0;
-static bool ptTareReady = false;
 
 // Single mux bank on ADC1 CH0 — the PT chain.
 static MuxBank adc1Banks[] = {
@@ -52,7 +48,7 @@ static Scanner scanner1(adc1, adc1Banks, 1);
 
 // ── Telemetry ──────────────────────────────────────────────────────────────
 static elapsedMillis telemetryTimer;
-static constexpr uint32_t TELEMETRY_INTERVAL_MS = 50;   // 20 Hz
+static constexpr uint32_t TELEMETRY_INTERVAL_MS = 4;    // ~250 Hz (2-ch sweep ~3.5 ms)
 
 static void sendPtCsv(CommsHandler& out) {
     char buf[512];
@@ -92,7 +88,6 @@ void setup() {
 
     comms.sendLine("PANDA_V2_PT_INIT");
     if (!adc1_ok) comms.sendLine("WARN:ADC1_INIT_FAIL");
-    comms.sendLine("PT_CFG:fullscale_psi=1500,zero_target=4.0mA,tare_scans=32");
 
     Serial.println("PandaV2 PT-only ready");
 }
@@ -100,32 +95,10 @@ void setup() {
 void loop() {
     scanner1.update();
 
-    if (scanner1.scanComplete()) {
-        scanner1.clearScanComplete();
-
-        if (!ptTareReady) {
-            for (uint8_t i = 0; i < NUM_PT_CH; i++) {
-                ptTareAccum[i] += muxA_data[i];
-            }
-
-            ptTareScanCount++;
-            if (ptTareScanCount >= PT_TARE_SCANS) {
-                for (uint8_t i = 0; i < NUM_PT_CH; i++) {
-                    const float avg = ptTareAccum[i] / float(ptTareScanCount);
-                    // Offset each channel so startup baseline lands on 4.0 mA.
-                    ptTareOffset[i] = avg - PT_ZERO_TARGET;
-                }
-                ptTareReady = true;
-                comms.sendLine("PT_TARE:READY");
-            }
-        }
-    }
-
-    // Convert mux-A values into forwarded PT signal units after startup tare.
-    // convertPT is currently identity with a calibration hook in SensorConfig.h.
+    // Convert mux-A voltages → PSI (convertPT is currently identity; add
+    // per-channel calibration in SensorConfig.h when transducer cal is known).
     for (uint8_t i = 0; i < NUM_PT_CH; i++) {
-        const float corrected = muxA_data[i] - (ptTareReady ? ptTareOffset[i] : 0.0f);
-        ptData[i] = convertPT(corrected, i);
+        ptData[i] = convertPT(muxA_data[i], i);
     }
 
     if (telemetryTimer >= TELEMETRY_INTERVAL_MS) {

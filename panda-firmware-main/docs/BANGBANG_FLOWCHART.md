@@ -31,7 +31,7 @@ stateDiagram-v2
     SUSTAIN   --> ABORT: SANITY_FAIL (PT out of bounds)\nemit SANITY_FAIL + ABORT_ENTER
     AUTO_VENT --> ABORT: SANITY_FAIL\nemit SANITY_FAIL + ABORT_ENTER
 
-    ABORT --> DISABLED: GC 'r' (disarm) only\nemit ABORT_CLEAR + BB_OFF
+    ABORT --> DISABLED: GC 'r' (disarm) or 'b<side>0' (ack)\nemit ABORT_CLEAR + BB_OFF
 
     note right of ABORT
       Latched. There is no
@@ -152,6 +152,7 @@ flowchart TD
 | `SANITY_FAIL` | `update` | PT NaN or outside `BB_PRESSURE_*_PSI` while non-`DISABLED` |
 | `OWN_CONFLICT` | `enableSustain`, `disableSustain`, `manualVent` | Command rejected by state preconditions |
 | `MDOT_ADJ` / `MDOT_CLAMP` | `_updateMdot` | Setpoint nudged / saturated at bound |
+| `COMMS_WD_ARM` / `COMMS_LOSS` / `COMMS_OK` / `COMMS_DISARM` | `serviceGcLinkWatchdog` (main.cpp) | Primary GC link armed / timed out / restored / silent past the disarm threshold. Side field is `-`, not `L`/`F` — these are link-wide, not per-side. |
 
 Every row of this table is a line of code. If you add a new state edge, you add a new row here.
 
@@ -160,5 +161,6 @@ Every row of this table is a line of code. If you add a new state edge, you add 
 ## 6. What's intentionally out of scope (phase 2)
 
 - **Venturi calibration.** `_computeMdot()` uses the incompressible Bernoulli form `m_dot = CdA · √(2·ρ·ΔP)`, with CdA = `BB_VENTURI_CDA_M2` (single board constant, currently 3.22e-5 m²) and per-side `density_kgm3` supplied via the `M` command. ΔP is `P_up − P_dn` clamped ≥ 0, converted psi → Pa. Throat/upstream areas are absorbed into CdA; update the constant if the venturi geometry changes.
-- **Secondary-link staleness detector.** A complete numeric 16-channel V2 frame refreshes the watchdog. If it expires after 250 ms while BB is active, that controller force-safes, emits `PT_STALE`, and requires explicit operator re-enable.
+- **Primary-link (GC) watchdog.** Any line from GC refreshes it; GC must send `h` at 5 Hz so a quiet hold is distinguishable from a severed cable. After 600 ms both controllers force-safe (`ABORT` exempt — its vent stays open); after 10 s the board disarms itself. Dormant until the first `h` of the boot, so it cannot nuisance-disarm against a GC that does not beat — watch `LINK:<armed>`. See §8 of `GC_USERS_GUIDE.md`.
+- **Secondary-link staleness detector.** A complete numeric 2-channel V2 frame refreshes the watchdog. If it expires after 50 ms while BB is active, that controller force-safes, emits `PT_STALE`, and requires explicit operator re-enable.
 - **AUTO_VENT → SUSTAIN auto-recovery.** Current behavior drops to `DISABLED` on `AV_EXIT` by design — requires explicit operator re-enable. Change only after an explicit ops decision.

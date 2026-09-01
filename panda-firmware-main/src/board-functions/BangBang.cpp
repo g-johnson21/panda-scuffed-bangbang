@@ -53,7 +53,16 @@ void BBController::bindIO(BBSetChannelFn setChannel, BBEmitFn emit) {
 }
 
 void BBController::_emitSafe(const char* cat, const char* detail) {
-    if (_emit) _emit(cat, _busId, detail);
+    if (!_emit) return;
+    char buf[96];
+    const float pt = _ptArray[_ptIdx];
+    if (!detail || detail[0] == '\0')
+        snprintf(buf, sizeof(buf), "pt=%.1f", pt);
+    else if (strncmp(detail, "pt=", 3) == 0)
+        snprintf(buf, sizeof(buf), "%s", detail);
+    else
+        snprintf(buf, sizeof(buf), "%s,pt=%.1f", detail, pt);
+    _emit(cat, _busId, buf);
 }
 
 // ── Config ────────────────────────────────────────────────────────────────
@@ -138,7 +147,10 @@ bool BBController::enableSustain() {
 
 void BBController::disableSustain() {
     if (_state == BBState::ABORT) {
-        _emitSafe("OWN_CONFLICT", "disable ignored while ABORT latched");
+        _setVent(false, "abort clear");
+        _abortLatched = false;
+        _goto(BBState::DISABLED, "abort clear (b0)");
+        _emitSafe("ABORT_CLEAR", "operator b0");
         return;
     }
     _setPress(false, "disable");
@@ -207,7 +219,11 @@ void BBController::forceSafe() {
 
 // ── Main loop tick ────────────────────────────────────────────────────────
 
-void BBController::update(bool armed) {
+void BBController::update(bool armed, bool psiSettled) {
+    // Always snapshot live PT for the 1 Hz BB heartbeat GC reads, even when
+    // disarmed or DISABLED — lastPressure must not stick at 0 across disarm.
+    _lastPressure = _ptArray[_ptIdx];
+
     if (!armed) {
         if (_state != BBState::DISABLED || _pressOpen || _ventOpen || _abortLatched) {
             forceSafe();
@@ -215,17 +231,18 @@ void BBController::update(bool armed) {
         return;
     }
 
-    // Snapshot PT once per tick.
-    _lastPressure = _ptArray[_ptIdx];
-
-    // Sanity bounds apply in every non-DISABLED state.
-    if (_state != BBState::DISABLED) {
+    // Sanity bounds apply in every non-DISABLED, non-ABORT state. ABORT is
+    // already latched safe (valves parked) and only forceSafe()/disarm clears
+    // it — re-checking here would just re-emit SANITY_FAIL/latchAbort every
+    // tick forever, flooding the telemetry stream and starving Serial2 TX.
+    // Also defer until the median filter has filled — early samples are not
+    // representative and must not trip SANITY_FAIL on enable.
+    if (psiSettled &&
+        _state != BBState::DISABLED && _state != BBState::ABORT) {
         if (isnanf(_lastPressure) ||
             _lastPressure < BB_PRESSURE_MIN_PSI ||
             _lastPressure > BB_PRESSURE_MAX_PSI) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "pt=%.1f", _lastPressure);
-            _emitSafe("SANITY_FAIL", buf);
+            _emitSafe("SANITY_FAIL", "out of bounds");
             latchAbort();
             return;
         }

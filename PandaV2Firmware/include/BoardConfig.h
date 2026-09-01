@@ -14,8 +14,8 @@ static constexpr size_t   RS485_RX_BUF   = 512;
 static constexpr size_t   RS485_TX_BUF   = 2048;
 static constexpr uint32_t PACKET_IDLE_MS = 100;
 
-// PT-only scanner: only mux A is populated.
-static constexpr uint8_t NUM_MUX_A_CH = 16;
+// PT-only scanner: mux A channels 0–1 (LOX/FUEL press PTs).
+static constexpr uint8_t NUM_MUX_A_CH = 2;
 
 // Telemetry output: 5 decimal places, id 'p' (defined inline at call site).
 static constexpr uint8_t DATA_DECIMALS = 5;

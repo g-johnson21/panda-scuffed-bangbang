@@ -122,8 +122,8 @@ public:
     // debugging before a flow).
     bool manualVentClose(bool force);
 
-    // Latched abort. Can be triggered from any state. Only forceSafe() (called
-    // on disarm) clears it.
+    // Latched abort. Can be triggered from any state. Cleared by disarm
+    // (forceSafe) or by `b<side>0` while armed (operator acknowledge).
     bool latchAbort();
 
     // Called on disarm or from setup(): unconditionally close both valves,
@@ -131,8 +131,10 @@ public:
     void forceSafe();
 
     // Main loop tick. `armed` reflects the current master-arm state. When
-    // !armed the controller self-safes and returns.
-    void update(bool armed);
+    // !armed the controller self-safes and returns. `psiSettled` should be
+    // false while the PT median filter is still warming up — sanity bounds are
+    // not enforced until it is true.
+    void update(bool armed, bool psiSettled = true);
 
     // Accessors
     BBState          state()         const { return _state; }
@@ -147,8 +149,16 @@ public:
     bool             hasVentHw()     const { return _ventCh != BB_DC_CH_UNSET; }
     bool             hasVenturiHw() const { return _vUp != BB_PT_CH_UNSET && _vDn != BB_PT_CH_UNSET; }
 
-    // For the channel-ownership check in main.cpp.
+    // For the channel-ownership check in main.cpp. Only reserves the channel
+    // while BB is actively driving it (non-DISABLED) — manual control is
+    // allowed whenever this side's BB is off. Exception: ABORT latched with
+    // no vent hardware has nothing left to drive (press was already forced
+    // closed by latchAbort()'s no-vent-HW path, and there's no vent channel
+    // to hold) — release the press channel so GC has a manual way to manage
+    // venting, without weakening the ABORT-only-clears-on-disarm invariant.
     bool ownsChannel(uint8_t ch1) const {
+        if (_state == BBState::DISABLED) return false;
+        if (_state == BBState::ABORT && !hasVentHw()) return false;
         return ch1 == _pressCh || (ch1 == _ventCh && _ventCh != BB_DC_CH_UNSET);
     }
 
