@@ -38,8 +38,9 @@ struct BBConfig {
     // Core bang-bang
     float    setpoint_psi      = 200.0f;
     float    deadband_psi      = 10.0f;   // symmetric, ±deadband/2 around setpoint
-    uint32_t wait_ms           = 500;     // min time between valve transitions
+    uint32_t wait_ms           = 500;     // minimum closed dwell before reopening
     uint32_t max_open_ms       = 0;       // slow-press cap; 0 disables
+    uint32_t close_delay_ms    = 15;      // energized→mechanically closed delay
 
     // Auto-venting
     float    autovent_trigger  = 100000.0f; // press > this enters AUTO_VENT; huge sentinel = disabled
@@ -101,9 +102,14 @@ public:
 
     // Per-side config mutators. All emit EVT:CFG_PUSH on success.
     void configureCore(float setpoint, float deadband, uint32_t waitMs, uint32_t maxOpenMs);
+    void configurePredictiveClose(uint32_t closeDelayMs);
     void configureVent(float triggerPsi, bool autoVentEnabled);
     void configureMdot(float mdotTarget, float spMin, float spMax,
                        float gain, float densityKgm3, bool enabled);
+
+    // Runtime-only predictive control gate. Defaults false and is cleared by
+    // forceSafe(), so EEPROM or a prior run can never silently re-enable it.
+    void setPredictiveEnabled(bool enabled);
 
     // Enter SUSTAIN (bang-bang control). Caller must have verified armed.
     // Rejected if already non-DISABLED. Emits BB_ON / OWN_CONFLICT.
@@ -134,13 +140,18 @@ public:
     // !armed the controller self-safes and returns. `psiSettled` should be
     // false while the PT median filter is still warming up — sanity bounds are
     // not enforced until it is true.
-    void update(bool armed, bool psiSettled = true);
+    void update(bool armed, bool psiSettled = true, uint32_t pressureSampleMs = 0);
 
     // Accessors
     BBState          state()         const { return _state; }
     bool             isPressOpen()   const { return _pressOpen; }
     bool             isVentOpen()    const { return _ventOpen; }
     float            lastPressure()  const { return _lastPressure; }
+    float            pressureRate()  const { return _pressureRate; }
+    float            projectedPressure() const { return _projectedPressure; }
+    float            predictionHorizonMs() const { return _predictionHorizonMs; }
+    bool             pressureRateValid() const { return _rateValid; }
+    bool             predictiveEnabled() const { return _predictiveEnabled; }
     float            lastMdot()      const { return _lastMdot; }
     const BBConfig&  config()        const { return _cfg; }
     char             busId()         const { return _busId; }
@@ -180,8 +191,16 @@ private:
     bool           _pressOpen     = false;
     bool           _ventOpen      = false;
     bool           _abortLatched  = false;
+    bool           _predictiveEnabled = false;
     float          _lastPressure  = 0.0f;
     float          _lastMdot      = 0.0f;
+    float          _pressureRate  = 0.0f;  // filtered psi/s
+    float          _projectedPressure = 0.0f;
+    float          _predictionHorizonMs = 0.0f;
+    float          _sampleIntervalMs = 0.0f;
+    float          _rateSamplePressure = 0.0f;
+    uint32_t       _rateSampleMs  = 0;
+    bool           _rateValid     = false;
     elapsedMillis  _switchTimer;   // debounce / slow-press wait
     elapsedMillis  _openTimer;     // tracks how long press has been open (slow-press)
     elapsedMillis  _mdotTimer;     // mdot update cadence
@@ -194,6 +213,7 @@ private:
     void _updateAutoVent();
     void _updateAbort();
     void _updateMdot();
+    void _updatePressureRate(uint32_t sampleMs);
     float _computeMdot();
     void _emitSafe(const char* cat, const char* detail);
 };

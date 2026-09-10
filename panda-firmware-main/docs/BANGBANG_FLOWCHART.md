@@ -73,11 +73,13 @@ flowchart TD
     J1 -- yes --> J2[press=0, vent=1<br/>state=AUTO_VENT<br/>emit AV_ENTER]
     J1 -- no --> K1{press open &&<br/>max_open_ms > 0 &&<br/>openTimer >= max_open_ms?}
     K1 -- yes --> K2[press=0<br/>switchTimer=0<br/>slow-press cap]
-    K1 -- no --> L1{switchTimer < wait_ms?}
-    L1 -- yes --> M
-    L1 -- no --> L2{PT > hi && press open?}
+    K1 -- no --> LP{predictive enabled && press open &&<br/>rate valid && rate > 0 &&<br/>PT + rate·totalHorizon >= hi?}
+    LP -- yes --> LPC[emit PRED_CLOSE<br/>press=0<br/>switchTimer=0]
+    LP -- no --> L2{PT >= hi && press open?}
     L2 -- yes --> L3[press=0<br/>switchTimer=0]
-    L2 -- no --> L4{PT < lo && press closed?}
+    L2 -- no --> L1{press closed &&<br/>switchTimer >= wait_ms?}
+    L1 -- no --> M
+    L1 -- yes --> L4{PT < lo?}
     L4 -- yes --> L5[press=1<br/>switchTimer=0]
     L4 -- no --> M
 
@@ -90,6 +92,7 @@ flowchart TD
 
     J2 --> M
     K2 --> M
+    LPC --> M
     L3 --> M
     L5 --> M
     N2 --> M
@@ -110,7 +113,7 @@ flowchart TD
 | State | Press solenoid | Vent solenoid | Notes |
 |---|---|---|---|
 | `DISABLED` | closed | closed | Safe default. Manual `S` commands permitted on non-BB channels. |
-| `SUSTAIN` | toggled by bang-bang within `[sp − db/2, sp + db/2]` | closed | If `max_open_ms > 0`, press is force-closed after that many ms continuously open and held closed until `wait_ms` elapses. |
+| `SUSTAIN` | toggled by bang-bang within `[sp − db/2, sp + db/2]` | closed | Predictive cutoff defaults OFF. When explicitly enabled and rising, closes when `PT + filtered_rate × (median_filter_delay + close_delay)` reaches deadband-high. Direct `PT ≥ high` remains the fallback. If `max_open_ms > 0`, press is force-closed after that many ms continuously open and held closed until `wait_ms` elapses. |
 | `AUTO_VENT` | closed | open | Holds until `PT ≤ sp + db/2`, then drops to `DISABLED`. |
 | `ABORT` | closed | open (if `hasVentHw`) | Latched. Only disarm clears. Without vent HW, press is still closed and `AV_NO_HW` is emitted. |
 
@@ -123,10 +126,12 @@ flowchart TD
 | GC command | Handler | Resulting call | Allowed from |
 |---|---|---|---|
 | `B<side><sp>,<db>,<wait>,<maxOpen>` | `handleB` | `configureCore()` + `bbSaveEeprom()` | Any state |
+| `D<side><closeMs>` | `handleD` | `configurePredictiveClose()` + `bbSaveEeprom()` | Any state |
 | `V<side><trig>,<autoOn>` | `handleV` | `configureVent()` + `bbSaveEeprom()` | Any state |
 | `M<side><mdot>,<spMin>,<spMax>,<gain>,<rho>,<on>` | `handleM` | `configureMdot()` + `bbSaveEeprom()` | Any state |
 | `b<side>1` | `handleLowerB` | `enableSustain()` | `DISABLED` and `gArmed` |
 | `b<side>0` | `handleLowerB` | `disableSustain()` | Any except `ABORT` |
+| `e<side>1` / `e<side>0` | `handleLowerE` | `setPredictiveEnabled()` | Enable requires `gArmed`; disable is always allowed |
 | `v<side>1` | `handleLowerV` | `manualVent()` | Any except `ABORT`, requires `gArmed` + `hasVentHw` |
 | `v<side>0` | `handleLowerV` | `manualVentClose(force=false)` | Only `AUTO_VENT`, requires pressure ≤ deadband-high |
 | `x<side>` | `handleLowerX` | `latchAbort()` | Any state |
@@ -139,10 +144,12 @@ flowchart TD
 
 | `EVT` category | Emitted from | Condition |
 |---|---|---|
-| `CFG_PUSH` | `configureCore/Vent/Mdot` | Any successful config write (also during EEPROM load) |
+| `CFG_PUSH` | `configureCore/PredictiveClose/Vent/Mdot` | Any successful config write (also during EEPROM load) |
 | `BB_ON` | `_goto(SUSTAIN, …)` | `enableSustain()` success |
 | `BB_OFF` | `_goto(DISABLED, …)` | `disableSustain()`, `AV_EXIT`, `forceSafe()` |
 | `VALVE` | `_setPress`, `_setVent` | Every edge on either solenoid, with reason string |
+| `PRED_MODE` | `setPredictiveEnabled` | Explicit enable/disable, or automatic disable during `forceSafe()` |
+| `PRED_CLOSE` | `_updateSustain` | Rising-pressure projection reaches deadband-high while press is open; includes rate, projected pressure, threshold, mechanical delay, total horizon, and live PT. |
 | `AV_ENTER` | `_goto(AUTO_VENT, …)` | Manual `v…1` or auto-trigger |
 | `AV_EXIT` | `manualVentClose`, `_updateAutoVent` | On close path; paired with `BB_OFF` |
 | `AV_REJECT_CLOSE` | `manualVentClose` | Refused because pressure too high |

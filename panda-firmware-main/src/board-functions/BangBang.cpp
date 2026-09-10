@@ -78,6 +78,14 @@ void BBController::configureCore(float setpoint, float deadband, uint32_t waitMs
     _emitSafe("CFG_PUSH", buf);
 }
 
+void BBController::configurePredictiveClose(uint32_t closeDelayMs) {
+    _cfg.close_delay_ms = closeDelayMs;
+    char buf[40];
+    snprintf(buf, sizeof(buf), "closeDelay=%lu",
+             (unsigned long)closeDelayMs);
+    _emitSafe("CFG_PUSH", buf);
+}
+
 void BBController::configureVent(float triggerPsi, bool autoVentEnabled) {
     _cfg.autovent_trigger = triggerPsi;
     _cfg.autovent_enabled = autoVentEnabled;
@@ -98,6 +106,12 @@ void BBController::configureMdot(float mdotTarget, float spMin, float spMax,
     snprintf(buf, sizeof(buf), "mdot=%.3f,spMin=%.1f,spMax=%.1f,gain=%.4f,rho=%.1f,on=%d",
              mdotTarget, spMin, spMax, gain, densityKgm3, enabled ? 1 : 0);
     _emitSafe("CFG_PUSH", buf);
+}
+
+void BBController::setPredictiveEnabled(bool enabled) {
+    if (_predictiveEnabled == enabled) return;
+    _predictiveEnabled = enabled;
+    _emitSafe("PRED_MODE", enabled ? "enabled=1" : "enabled=0");
 }
 
 // ── State transitions ─────────────────────────────────────────────────────
@@ -209,6 +223,7 @@ bool BBController::latchAbort() {
 void BBController::forceSafe() {
     _setPress(false, "forceSafe");
     _setVent(false, "forceSafe");
+    setPredictiveEnabled(false);
     bool wasLatched = _abortLatched;
     _abortLatched = false;
     if (_state != BBState::DISABLED) {
@@ -219,10 +234,11 @@ void BBController::forceSafe() {
 
 // ── Main loop tick ────────────────────────────────────────────────────────
 
-void BBController::update(bool armed, bool psiSettled) {
+void BBController::update(bool armed, bool psiSettled, uint32_t pressureSampleMs) {
     // Always snapshot live PT for the 1 Hz BB heartbeat GC reads, even when
     // disarmed or DISABLED — lastPressure must not stick at 0 across disarm.
     _lastPressure = _ptArray[_ptIdx];
+    _updatePressureRate(pressureSampleMs);
 
     if (!armed) {
         if (_state != BBState::DISABLED || _pressOpen || _ventOpen || _abortLatched) {
@@ -258,6 +274,76 @@ void BBController::update(bool armed, bool psiSettled) {
     _updateMdot();
 }
 
+void BBController::_updatePressureRate(uint32_t sampleMs) {
+    // update() runs much faster than new V2 PT frames arrive. Use the frame
+    // timestamp so repeated reads of the same pressure do not pull the
+    // derivative toward zero.
+    if (sampleMs == 0) {
+        _rateValid = false;
+        _pressureRate = 0.0f;
+        _projectedPressure = _lastPressure;
+        _predictionHorizonMs = 0.0f;
+        _sampleIntervalMs = 0.0f;
+        _rateSampleMs = 0;
+        return;
+    }
+    if (sampleMs == _rateSampleMs) return;
+
+    if (!isfinite(_lastPressure)) {
+        _rateValid = false;
+        _pressureRate = 0.0f;
+        _projectedPressure = _lastPressure;
+        _rateSampleMs = sampleMs;
+        _rateSamplePressure = _lastPressure;
+        return;
+    }
+
+    if (_rateSampleMs == 0) {
+        _rateSampleMs = sampleMs;
+        _rateSamplePressure = _lastPressure;
+        _projectedPressure = _lastPressure;
+        return;
+    }
+
+    const uint32_t dtMs = sampleMs - _rateSampleMs;
+    if (dtMs == 0 || dtMs > BB_RATE_RESET_MS) {
+        _rateValid = false;
+        _pressureRate = 0.0f;
+        _sampleIntervalMs = 0.0f;
+    } else {
+        if (_sampleIntervalMs > 0.0f) {
+            _sampleIntervalMs +=
+                BB_PRESSURE_RATE_ALPHA * ((float)dtMs - _sampleIntervalMs);
+        } else {
+            _sampleIntervalMs = (float)dtMs;
+        }
+        const float instantaneousRate =
+            (_lastPressure - _rateSamplePressure) * (1000.0f / (float)dtMs);
+        if (isfinite(instantaneousRate)) {
+            if (_rateValid) {
+                _pressureRate +=
+                    BB_PRESSURE_RATE_ALPHA * (instantaneousRate - _pressureRate);
+            } else {
+                _pressureRate = instantaneousRate;
+                _rateValid = true;
+            }
+        } else {
+            _rateValid = false;
+            _pressureRate = 0.0f;
+        }
+    }
+
+    _rateSampleMs = sampleMs;
+    _rateSamplePressure = _lastPressure;
+    const float risingRate =
+        (_rateValid && _pressureRate > 0.0f) ? _pressureRate : 0.0f;
+    const float medianDelayMs =
+        0.5f * (float)(PT_PSI_MEDIAN_WINDOW - 1) * _sampleIntervalMs;
+    _predictionHorizonMs = (float)_cfg.close_delay_ms + medianDelayMs;
+    _projectedPressure =
+        _lastPressure + risingRate * (_predictionHorizonMs / 1000.0f);
+}
+
 void BBController::_updateSustain() {
     // Auto-vent trigger takes precedence over bang-bang.
     if (_cfg.autovent_enabled &&
@@ -280,12 +366,24 @@ void BBController::_updateSustain() {
         return;
     }
 
-    if (_switchTimer < _cfg.wait_ms) return;
-
-    if (_lastPressure > hi && _pressOpen) {
-        _setPress(false, "above hi");
+    // Closing must never be held off by wait_ms: with a high-pressure source,
+    // the prediction can cross deadband-high shortly after opening. wait_ms
+    // is enforced below only as the closed dwell before another opening.
+    if (_predictiveEnabled && _pressOpen && _rateValid && _pressureRate > 0.0f &&
+        _projectedPressure >= hi) {
+        char buf[88];
+        snprintf(buf, sizeof(buf),
+                 "rate=%.1f,pred=%.1f,hi=%.1f,delay=%lu,horizon=%.1f",
+                 _pressureRate, _projectedPressure, hi,
+                 (unsigned long)_cfg.close_delay_ms, _predictionHorizonMs);
+        _emitSafe("PRED_CLOSE", buf);
+        _setPress(false, "predictive cutoff");
         _switchTimer = 0;
-    } else if (_lastPressure < lo && !_pressOpen) {
+    } else if (_lastPressure >= hi && _pressOpen) {
+        _setPress(false, "at/above hi");
+        _switchTimer = 0;
+    } else if (!_pressOpen && _switchTimer >= _cfg.wait_ms &&
+               _lastPressure < lo) {
         _setPress(true, "below lo");
         _switchTimer = 0;
     }
@@ -376,12 +474,14 @@ void bbLoadEeprom(BBController& lox, BBController& fuel) {
 
     lox.configureCore(block.lox.setpoint_psi, block.lox.deadband_psi,
                       block.lox.wait_ms, block.lox.max_open_ms);
+    lox.configurePredictiveClose(block.lox.close_delay_ms);
     lox.configureVent(block.lox.autovent_trigger, block.lox.autovent_enabled);
     lox.configureMdot(block.lox.mdot_target, block.lox.sp_min, block.lox.sp_max,
                       block.lox.mdot_gain, block.lox.density_kgm3, block.lox.mdot_enabled);
 
     fuel.configureCore(block.fuel.setpoint_psi, block.fuel.deadband_psi,
                        block.fuel.wait_ms, block.fuel.max_open_ms);
+    fuel.configurePredictiveClose(block.fuel.close_delay_ms);
     fuel.configureVent(block.fuel.autovent_trigger, block.fuel.autovent_enabled);
     fuel.configureMdot(block.fuel.mdot_target, block.fuel.sp_min, block.fuel.sp_max,
                        block.fuel.mdot_gain, block.fuel.density_kgm3, block.fuel.mdot_enabled);

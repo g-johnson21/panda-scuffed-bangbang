@@ -36,6 +36,7 @@ static constexpr size_t RX_BUF_SIZE = 256;
 // (most importantly a disable/disarm) onto the wire.
 static constexpr uint32_t TELEMETRY_INTERVAL_MS = 50;       // 20 Hz
 static constexpr uint32_t BB_HEARTBEAT_INTERVAL_MS = 1000;  // 1 Hz
+static constexpr uint32_t BB_DEBUG_INTERVAL_MS = 100;       // 10 Hz
 static constexpr size_t TX_PRIORITY_RESERVE = 256;
 
 // ============== GC primary-link (Serial2) watchdog ============= //
@@ -109,8 +110,8 @@ static constexpr uint8_t BB_FUEL_DC_CH = 2;
 // auto-vent / abort for that side; those commands will be rejected with
 // EVT:...:AV_NO_HW until a real channel is configured here.
 // TODO(user): set these to the actual vent DC channels on your board.
-static constexpr uint8_t BB_LOX_VENT_DC_CH  = BB_DC_CH_UNSET;
-static constexpr uint8_t BB_FUEL_VENT_DC_CH = BB_DC_CH_UNSET;
+static constexpr uint8_t BB_LOX_VENT_DC_CH  = 3;
+static constexpr uint8_t BB_FUEL_VENT_DC_CH = 4;
 
 // Venturi PT indices for mass-flow calculation (0-indexed into v2PtData[]).
 // BB_PT_CH_UNSET disables mass-flow correction for that side regardless of
@@ -127,9 +128,19 @@ static constexpr float BB_PRESSURE_MAX_PSI = 4000.0f;
 // V2 sends PT data at ~250 Hz. ~50 ms without a complete frame force-safes any
 // active BB controller; operator must explicitly re-enable after data resumes.
 static constexpr uint32_t BB_PT_STALE_MS = 50;
+// BB consumes the rolling-median PSI signal. A monotonic ramp is delayed by
+// half this window, so predictive cutoff compensates that measured delay in
+// addition to the configured mechanical valve-close delay.
+static constexpr uint8_t PT_PSI_MEDIAN_WINDOW = 75;
 
 // Mass-flow correction update cadence (ms between setpoint nudges).
 static constexpr uint32_t BB_MDOT_UPDATE_MS = 500;
+
+// Predictive press-valve cutoff. Pressure rate is low-pass filtered so one
+// noisy PT derivative does not command an early close. The mechanical delay
+// itself is persisted per side in BBConfig and defaults to 15 ms.
+static constexpr float BB_PRESSURE_RATE_ALPHA = 0.20f;
+static constexpr uint32_t BB_RATE_RESET_MS = 100;
 
 // Venturi CdA (discharge coefficient × effective throat area) in m².
 // Single value covers both LOX and Fuel venturis — update here if they
@@ -143,7 +154,7 @@ static constexpr float PSI_TO_PA         = 6894.757f;
 
 // EEPROM layout for BB config persistence. Magic bumped when BBConfig
 // struct layout changed; old EEPROM contents ignored on mismatch.
-static constexpr uint16_t BB_EEPROM_MAGIC = 0xBB44;
+static constexpr uint16_t BB_EEPROM_MAGIC = 0xBB45;
 static constexpr int      BB_EEPROM_ADDR  = 0;
 
 // PT tare offsets (PSI subtracted after V2→PSI conversion). Separate EEPROM

@@ -39,11 +39,12 @@ Response lines: `Arming!`, `Disarming!`, `SEQ_ABORT: Outputs de-energized`, opti
 
 ### 2.3 Bang-bang configuration (persisted to EEPROM)
 
-All three take effect immediately on the running controller and are saved to EEPROM. Format is strict — any parse failure replies `BB_ERROR:parse` and no state changes.
+All four take effect immediately on the running controller and are saved to EEPROM. Format is strict — any parse failure replies `BB_ERROR:parse` and no state changes.
 
 | Command | Fields |
 |---|---|
-| `B<side><sp>,<db>,<wait>,<maxOpen>` | setpoint psi, symmetric deadband psi (>0), valve-transition debounce ms (≤60000), slow-press max-open ms (≤60000; 0 = disabled) |
+| `B<side><sp>,<db>,<wait>,<maxOpen>` | setpoint psi, symmetric deadband psi (>0), minimum closed dwell before reopening in ms (≤60000), slow-press max-open ms (≤60000; 0 = disabled). Closing is never delayed by `wait`. |
+| `D<side><closeMs>` | Estimated press-solenoid de-energize-to-mechanically-closed delay in ms (0–1000). Defaults to 15 ms. This value is persisted, but predictive cutoff remains runtime-disabled until explicitly enabled. |
 | `V<side><trig>,<autoOn01>` | auto-vent trigger psi, auto-vent enable flag (0/1) |
 | `M<side><mdot>,<spMin>,<spMax>,<gain>,<rho>,<on01>` | mass-flow target [kg/s], setpoint low/high bounds [psi], gain [psi per (kg/s error) per 500 ms tick], propellant density [kg/m³; ≤0 disables computation even if `on01=1`], enable flag (0/1) |
 
@@ -55,6 +56,8 @@ Each emits `EVT:<ms>:CFG_PUSH:<side>:<k=v,...>` and rewrites the EEPROM block.
 |---|---|---|
 | `b<side>1` | Enter `SUSTAIN`. | `gArmed`, BB currently `DISABLED`. |
 | `b<side>0` | Leave `SUSTAIN` → `DISABLED`. Press closed. Vent untouched. **Also clears a latched `ABORT` without disarming** (operator acknowledge). | Rejected in `ABORT` only if vent close fails (N/A today — vent HW unset). |
+| `e<side>1` | Enable predictive cutoff for this armed session. Emits `PRED_MODE`. Not persisted. | `gArmed`. |
+| `e<side>0` | Disable predictive cutoff. Rate calculation and `BBD:` telemetry continue, but prediction cannot actuate the valve. | Any arm or BB state. |
 | `v<side>1` | **Manual auto-vent**: press closed, vent open, state → `AUTO_VENT`. | `gArmed`, vent DC channel configured, not in `ABORT`. |
 | `v<side>0` | Exit `AUTO_VENT` → `DISABLED`. **Refused if pressure > deadband-high** — emits `EVT:…:AV_REJECT_CLOSE`. To override, issue `r` (disarm) instead. | Only valid in `AUTO_VENT`. |
 | `x<side>` | **Latched ABORT**: press closed, vent open. State → `ABORT`. Cleared by `r` (disarm) or `b<side>0` (acknowledge while armed). | None. Safe from any state. |
@@ -120,6 +123,16 @@ LINK:<armed01>:<lost01>:<silent_ms>
 | `lost01` | `1` while the link is currently timed out (stage 1 tripped). |
 | `silent_ms` | Milliseconds since the last line from GC. `0` when un-armed. |
 
+### 3.2c Predictive-close debug (10 Hz, one per side)
+
+```
+BBD:<side>:<state>:<press01>:<pressure_psi>:<rate_psi_s>:<projected_close_psi>:<deadband_high_psi>:<close_delay_ms>:<total_horizon_ms>:<rate_valid01>:<predictive_enabled01>
+```
+
+The pressure rate updates only when a new V2 PT frame arrives and is exponentially filtered (`BB_PRESSURE_RATE_ALPHA`). Because the controller consumes a 75-sample rolling median, a rising signal is delayed by half of that window. The firmware measures the PT sample interval and computes `total_horizon_ms = close_delay_ms + 0.5 × (PT_PSI_MEDIAN_WINDOW − 1) × sample_interval_ms`. While pressure is rising, `projected_close_psi = pressure_psi + rate_psi_s × total_horizon_ms / 1000`. The controller de-energizes an open press valve when that projection reaches deadband-high. A non-rising or not-yet-valid rate contributes zero lookahead, and the normal close at deadband-high remains active as a fallback.
+
+`rate_valid01=0` means there are not yet two timely pressure samples or the estimator reset after a sample gap. `predictive_enabled01=1` means the projection is currently allowed to close the valve. `BBD:` is a separate line so existing fixed-field `BB:` heartbeat parsers remain compatible. Like other periodic telemetry, it is best-effort and may be skipped to preserve command/event TX capacity.
+
 ### 3.3 Audit events (on every BB state change)
 
 ```
@@ -130,10 +143,12 @@ This is the authoritative log for safety review. Every bang-bang `EVT:` `detail`
 
 | Category | Emitted when |
 |---|---|
-| `CFG_PUSH` | `B`/`V`/`M` command accepted and applied. `detail` is the parsed fields plus `pt`. |
+| `CFG_PUSH` | `B`/`D`/`V`/`M` command accepted and applied. `detail` is the parsed fields plus `pt`. |
 | `BB_ON` | Entered `SUSTAIN`. |
 | `BB_OFF` | Left a non-`DISABLED` state into `DISABLED` via operator command. |
 | `VALVE` | Press or vent actually actuated. `detail` = `press=N,reason=…,pt=…` or `vent=N,reason=…,pt=…`. |
+| `PRED_MODE` | Predictive cutoff was explicitly enabled or disabled. `detail` = `enabled=0|1,pt=…`. It is automatically disabled by `forceSafe()`. |
+| `PRED_CLOSE` | Predictive lookahead reached deadband-high while the press valve was open. `detail` includes filtered rate, projected pressure, deadband-high, configured mechanical delay, total prediction horizon, and live pressure. Immediately followed by the corresponding `VALVE` event. |
 | `AV_ENTER` | Entered `AUTO_VENT` (auto-trigger or manual). |
 | `AV_EXIT` | Left `AUTO_VENT` (pressure dropped to ≤ deadband-high, or operator close). |
 | `AV_REJECT_CLOSE` | `v<side>0` refused because pressure was still above deadband-high. |
@@ -184,26 +199,28 @@ If the secondary link drops or delivers an incomplete/non-numeric frame, it is n
 | Constant | Meaning | Current value |
 |---|---|---|
 | `BB_LOX_PT_CH` / `BB_FUEL_PT_CH` | Index into `v2PtPsiData[]` for the primary press-line PT | 0, 1 |
-| `BB_LOX_DC_CH` / `BB_FUEL_DC_CH` | 1-indexed press-solenoid DC channel | 4, 7 |
+| `BB_LOX_DC_CH` / `BB_FUEL_DC_CH` | 1-indexed press-solenoid DC channel | 1, 2 |
 | `BB_LOX_VENT_DC_CH` / `BB_FUEL_VENT_DC_CH` | 1-indexed vent-solenoid DC channel | **UNSET** — you must set these before auto-vent / abort do anything. |
 | `BB_*_VENTURI_UP_PT` / `BB_*_VENTURI_DN_PT` | 0-indexed venturi taps for mass-flow correction | **UNSET** — mass-flow loop is a no-op until these are set. |
 | `BB_PRESSURE_MIN_PSI` / `BB_PRESSURE_MAX_PSI` | Sanity bounds; outside this range while armed → ABORT | −50 … 4000 |
-| `BB_EEPROM_MAGIC` | Bumped on `BBConfig` layout changes; old blobs ignored | `0xBB43` |
+| `BB_EEPROM_MAGIC` | Bumped on `BBConfig` layout changes; old blobs ignored | `0xBB45` |
 
 ## 6. Cold-start behavior
 
 1. `setup()` initializes both RS-485 links, SPI, and scanners.
 2. `bindIO()` wires the BB controllers to `bbSetChannel` and `bbEmit`.
 3. `forceSafe()` is called on both controllers — press closed, vent closed, ABORT latch cleared, state = DISABLED. This runs **before** `bbLoadEeprom()` so persisted config is restored but state is not.
-4. `bbLoadEeprom()` restores setpoints/deadbands/wait/maxOpen/vent config/mdot config. `EVT:CFG_PUSH` is emitted three times per side (core, vent, mdot) as the load applies them.
+4. `bbLoadEeprom()` restores setpoints/deadbands/wait/maxOpen/predictive close delay/vent config/mdot config. `EVT:CFG_PUSH` is emitted four times per side (core, predictive close, vent, mdot) as the load applies them.
 5. `ptTareLoadEeprom()` restores persisted PT tare offsets (no event emitted).
 6. `Panda Initialized!` is sent.
 
-The operator must issue `a` to arm and `b<side>1` to start bang-bang.
+The operator must issue `a` to arm and `b<side>1` to start bang-bang. Predictive cutoff starts disabled on every boot and must be explicitly enabled with `e<side>1` after arming.
 
 ## 7. Safety-critical defaults to remember
 
 - **Every BB state change emits an `EVT:`** — GC should log this stream and surface the latest line next to the live state.
+- **Predictive actuation defaults OFF and is never persisted.** Arm first, then issue `e<side>1` to opt in. Any `forceSafe()` path—including disarm, PT staleness, or GC-link loss—turns it back off. Rate calculation and `BBD:` telemetry remain active while disabled.
+- **Predictive close defaults to 15 ms of mechanical delay.** During testing, tune it remotely with `D<side><closeMs>` and log the 10 Hz `BBD:` rows plus `PRED_MODE`/`PRED_CLOSE`/`VALVE` events. The total lookahead also compensates the measured half-window latency of the 75-sample median filter; `BBD:` reports both the configured delay and total horizon. The estimator ignores repeated main-loop reads of a single V2 frame.
 - **`ABORT` clears on disarm (`r`) or `b<side>0` while armed** (operator acknowledge). There is no separate "unabort" command.
 - **Sanity-bound violation auto-latches `ABORT`.** The PT read is taken once per tick at the top of `update()`, so a single bad sample is enough.
 - **Mass-flow correction only moves the setpoint during `SUSTAIN`** and only if venturi PTs are wired **and** `density_kgm3 > 0`. It never overrides `sp_min`/`sp_max`.

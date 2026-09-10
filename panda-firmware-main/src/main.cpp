@@ -29,9 +29,11 @@
  *   's<chHex><state>.<ms 5-digit>'      Sequence step append
  *   'f'                                 Fire loaded sequence
  *   'B<side><sp>,<db>,<wait>,<maxOpen>' Configure BB core (L or F)
+ *   'D<side><closeMs>'                  Configure predictive close delay
  *   'V<side><trig>,<autoOn01>'          Configure BB auto-vent
  *   'M<side><mdot>,<spMin>,<spMax>,<gain>,<rho>,<on01>'  Configure BB massflow
  *   'b<side><0|1>'                      Arm/disarm bang-bang control
+ *   'e<side><0|1>'                      Enable/disable predictive cutoff
  *   'v<side><0|1>'                      Manual vent open(1) / close(0)
  *   'x<side>'                           Latched abort (cleared only by 'r')
  *   'h'                                 GC heartbeat (see link watchdog below)
@@ -45,6 +47,8 @@
  *   's<f0>,s<f1>,...'   — 12 solenoid current voltages (V1 local)
  *   't<f0>,t<f1>,...'   — 12 LC+TC voltages (V1 local)
  *   'BB:<L|F>:<state>:<press>:<vent>:<pressure>'   1 Hz summary heartbeat
+ *   'BBD:<side>:<state>:<press>:<pressure>:<rate>:<projected>:<hi>:<delay>:<horizon>:<valid>:<enabled>'
+ *                                                   10 Hz predictive debug
  *   'LINK:<armed>:<lost>:<silentMs>'                1 Hz link-watchdog status
  *   'EVT:<ms>:<cat>:<L|F>:<detail>'                audit event on every BB
  * transition
@@ -181,8 +185,6 @@ static bool hasFreshV2Pt() {
 // filtered value, so a real fault still trips it, just without chasing
 // every single noisy sample. Raw v2PtData is left unfiltered so GC retains
 // the true signal for diagnostics.
-static constexpr uint8_t PT_PSI_MEDIAN_WINDOW = 75;
-
 struct PsiMedianFilter {
   float ring[PT_PSI_MEDIAN_WINDOW];
   uint8_t count = 0;
@@ -321,6 +323,27 @@ static void handleV(const char *pkt) { // auto-vent config
   bbSaveEeprom(bbLox, bbFuel);
 }
 
+static void handleD(const char *pkt) { // predictive close-delay config
+  if (strlen(pkt) < 3) {
+    Serial2.println("BB_ERROR:short");
+    return;
+  }
+  BBController *ctrl = pickSide(pkt[1]);
+  if (!ctrl) {
+    Serial2.println("BB_ERROR:bad_side");
+    return;
+  }
+  unsigned long closeDelayMs;
+  char trailing;
+  if (sscanf(pkt + 2, "%lu%c", &closeDelayMs, &trailing) != 1 ||
+      closeDelayMs > 1000UL) {
+    Serial2.println("BB_ERROR:parse");
+    return;
+  }
+  ctrl->configurePredictiveClose((uint32_t)closeDelayMs);
+  bbSaveEeprom(bbLox, bbFuel);
+}
+
 static void handleM(const char *pkt) { // massflow config
   if (strlen(pkt) < 4) {
     Serial2.println("BB_ERROR:short");
@@ -370,6 +393,29 @@ static void handleLowerB(const char *pkt) { // enable/disable sustain
     ctrl->enableSustain();
   } else if (stCh == '0') {
     ctrl->disableSustain();
+  } else {
+    Serial2.println("BB_ERROR:bad_arg");
+  }
+}
+
+static void handleLowerE(const char *pkt) { // predictive cutoff enable
+  if (strlen(pkt) != 3) {
+    Serial2.println("BB_ERROR:parse");
+    return;
+  }
+  BBController *ctrl = pickSide(pkt[1]);
+  if (!ctrl) {
+    Serial2.println("BB_ERROR:bad_side");
+    return;
+  }
+  if (pkt[2] == '1') {
+    if (!gArmed) {
+      Serial2.println("BB_ERROR:not_armed");
+      return;
+    }
+    ctrl->setPredictiveEnabled(true);
+  } else if (pkt[2] == '0') {
+    ctrl->setPredictiveEnabled(false);
   } else {
     Serial2.println("BB_ERROR:bad_arg");
   }
@@ -498,6 +544,36 @@ static void printBbHeartbeat(const BBController &c) {
   Serial2.print(c.isVentOpen() ? 1 : 0);
   Serial2.print(':');
   Serial2.println(c.lastPressure(), 1);
+}
+
+// BBD:<side>:<state>:<press01>:<pressure_psi>:<rate_psi_s>:
+//     <projected_close_psi>:<deadband_high_psi>:<close_delay_ms>:
+//     <total_horizon_ms>:<rate_valid01>:<predictive_enabled01>
+// Kept separate from BB: so existing GC heartbeat parsers remain compatible.
+static void printBbDebug(const BBController &c) {
+  const float hi = c.config().setpoint_psi + c.config().deadband_psi * 0.5f;
+  Serial2.print("BBD:");
+  Serial2.print(c.busId());
+  Serial2.print(':');
+  Serial2.print(stateStr(c.state()));
+  Serial2.print(':');
+  Serial2.print(c.isPressOpen() ? 1 : 0);
+  Serial2.print(':');
+  Serial2.print(c.lastPressure(), 2);
+  Serial2.print(':');
+  Serial2.print(c.pressureRate(), 2);
+  Serial2.print(':');
+  Serial2.print(c.projectedPressure(), 2);
+  Serial2.print(':');
+  Serial2.print(hi, 2);
+  Serial2.print(':');
+  Serial2.print(c.config().close_delay_ms);
+  Serial2.print(':');
+  Serial2.print(c.predictionHorizonMs(), 1);
+  Serial2.print(':');
+  Serial2.print(c.pressureRateValid() ? 1 : 0);
+  Serial2.print(':');
+  Serial2.println(c.predictiveEnabled() ? 1 : 0);
 }
 
 // ── GC link status line (1 Hz, alongside the BB heartbeat) ───────────────
@@ -812,12 +888,16 @@ void loop() {
     // Bang-bang commands
     else if (idChar == 'B')
       handleB(rxPacket);
+    else if (idChar == 'D')
+      handleD(rxPacket);
     else if (idChar == 'V')
       handleV(rxPacket);
     else if (idChar == 'M')
       handleM(rxPacket);
     else if (idChar == 'b')
       handleLowerB(rxPacket);
+    else if (idChar == 'e')
+      handleLowerE(rxPacket);
     else if (idChar == 'v')
       handleLowerV(rxPacket);
     else if (idChar == 'x')
@@ -861,8 +941,9 @@ void loop() {
       bbFuel.forceSafe();
     }
   }
-  bbLox.update(gArmed, ptPsiSettled());
-  bbFuel.update(gArmed, ptPsiSettled());
+  const uint32_t pressureSampleMs = hasFreshV2Pt() ? lastV2PtMs : 0;
+  bbLox.update(gArmed, ptPsiSettled(), pressureSampleMs);
+  bbFuel.update(gArmed, ptPsiSettled(), pressureSampleMs);
 
   // ========== DAQ ==========
   sScanner.update();
@@ -870,6 +951,7 @@ void loop() {
 
   static uint32_t lastTelemetryMs = 0;
   static uint32_t lastHeartbeatMs = 0;
+  static uint32_t lastBbDebugMs = 0;
   static uint32_t lastHexDiagMs = 0;
   const uint32_t now = millis();
 
@@ -916,6 +998,15 @@ void loop() {
       printBbHeartbeat(bbLox);
       printBbHeartbeat(bbFuel);
       printLinkStatus(now);
+    }
+  }
+
+  if (now - lastBbDebugMs >= BB_DEBUG_INTERVAL_MS) {
+    lastBbDebugMs = now;
+    if (Serial2.availableForWrite() >=
+        static_cast<int>(TX_PRIORITY_RESERVE + 192)) {
+      printBbDebug(bbLox);
+      printBbDebug(bbFuel);
     }
   }
 }
